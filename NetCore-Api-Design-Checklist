@@ -1,0 +1,509 @@
+# API template checklist
+
+## Example folder structure
+
+```text
+MyCompany.Api/
+├── global.json                      SDK version pin
+├── Directory.Build.props            shared build settings (section 21)
+├── Directory.Packages.props         central package versions
+├── .editorconfig
+├── .gitattributes
+├── .gitignore
+├── MyCompany.Api.slnx
+├── docs/
+│   ├── openapi/
+│   │   └── v1.json                  exported, committed contract (10.3)
+│   └── errors.md                    error code catalogue (3.6)
+└── src/
+    ├── MyCompany.Api.AppHost/       Aspire orchestration (20.1)
+    │   └── AppHost.cs
+    ├── MyCompany.Api.ServiceDefaults/   telemetry, health, resilience, discovery (20.2)
+    │   └── Extensions.cs
+    ├── MyCompany.Api.Host/          composition root, the only Program.cs (20.3)
+    │   ├── Program.cs
+    │   ├── appsettings.json
+    │   └── appsettings.Development.json
+    ├── BuildingBlocks/              shared code used by every module (20.6)
+    │   ├── Json/                    JsonDefaults
+    │   ├── Errors/                  problem details mapping, error codes
+    │   ├── Http/                    correlation, ETags, Merge Patch, security headers
+    │   ├── Idempotency/
+    │   ├── RateLimiting/
+    │   ├── Caching/                 key conventions, cache registration
+    │   ├── Persistence/             connection factory, unit of work, type handlers, tenant session
+    │   ├── AsyncOperations/         202 status resource and background worker
+    │   └── Modules/                 IModule contract
+    └── Modules/
+        └── Catalog/
+            ├── Catalog/             module class library (20.4)
+            │   ├── CatalogModule.cs         IModule implementation
+            │   ├── Domain/
+            │   │   └── Product.cs
+            │   ├── Application/
+            │   │   ├── IProductRepository.cs
+            │   │   ├── IProductReadQueries.cs
+            │   │   └── ProductService.cs    shared logic and caching (14.8)
+            │   ├── Infrastructure/
+            │   │   ├── ProductRepository.cs
+            │   │   ├── ProductReadQueries.cs
+            │   │   └── Sql/
+            │   │       └── ProductSql.cs
+            │   ├── Endpoints/               one folder per endpoint
+            │   │   └── Products/
+            │   │       ├── CreateProduct/   Endpoint.cs, Request.cs, Validator.cs, Response.cs
+            │   │       ├── GetProduct/
+            │   │       ├── ListProducts/
+            │   │       ├── PatchProduct/    JSON Merge Patch
+            │   │       └── UpdatePrice/     sub-resource PUT
+            │   ├── Clients/                 typed HTTP clients to other services (18)
+            │   ├── db/
+            │   │   └── schema.sql           reference schema, local development only (14.23)
+            │   └── README.md                tables, indexes and settings the module expects
+            └── Catalog.Contracts/   public interface for other modules (15.4)
+                ├── ICatalogApi.cs
+                └── ProductDto.cs
+```
+
+In a monolith, the Host references many modules. As a microservice, a Host references one module (20.7).
+
+---
+
+## 1. Tracing, correlation and observability
+
+1. OpenTelemetry traces, metrics and logs, configured once in ServiceDefaults and exported over OTLP. Locally they go to the Aspire dashboard. In production the backend is the deployer's choice.
+2. Automatic instrumentation for incoming requests, outgoing HTTP calls, PostgreSQL commands and Valkey calls.
+3. W3C `traceparent`/`tracestate` propagation, inbound and outbound.
+4. `traceresponse` and `X-Trace-Id` on every response; `traceId` in every problem details body.
+5. Accept an inbound `X-Correlation-Id` (or `X-Request-ID`), echo it in the response, and add it to the span and the log scope.
+6. Metrics per endpoint: request rate, error rate and duration. Add cache hit/miss, rate-limit rejections and idempotency replays.
+7. The module name and version on every span and metric, so modules can be told apart inside one monolith process.
+8. Health checks:
+   - `/health/live`: the process is up.
+   - `/health/ready`: PostgreSQL and Valkey are reachable. A cache outage alone must not fail it (12.14).
+   - `/health/startup`: PostgreSQL is reachable and the module's tables exist, so a missing schema fails fast with a clear message.
+   - Aspire maps `/health` and `/alive` by default; rename them to the paths above.
+9. A synthetic availability check that calls `/health/ready` on a schedule.
+
+## 2. HTTP semantics, resources and status codes
+
+1. Routes use nouns only and plural collections, at most `collection/item/collection` deep. `/customers/1/orders` is fine; `/customers/1/orders/99/products` is too deep.
+2. Don't mirror the database schema. Request and response types are separate from entities, with a mapping layer between them.
+3. POST goes to the collection and the server assigns the ID, returning 201 + `Location`.
+   - A client-supplied ID on POST returns 400.
+   - A POST to an item URI returns 405.
+4. PUT replaces the whole resource and must be idempotent.
+5. DELETE returns 204, and 404 when repeated.
+6. HEAD and OPTIONS are supported.
+7. Status codes:
+   - 200, 201 (+ `Location`), 202 (async, section 8), 204
+   - 303 (async operation finished), 304 (not modified)
+   - 400, 401, 403, 404, 405, 406, 409, 412, 413, 415, 422, 428, 429 (+ `Retry-After`)
+   - 503 (dependency down or feature disabled), 504 (timeout)
+8. JSON only:
+   - `application/json` for bodies.
+   - `application/merge-patch+json` for PATCH.
+   - `application/problem+json` for errors.
+   - No XML.
+9. Bulk operations on collections (POST a batch, bulk PUT) where clients would otherwise make many small calls. Opt-in per resource.
+10. URLs stay under 2,000 characters; return 414 above the server limit.
+11. Times are UTC ISO 8601 (`DateTimeOffset`), read through `TimeProvider`.
+12. IDs are UUIDv7: sortable, index-friendly and not guessable.
+13. Partial updates come in two styles:
+    - **Sub-resource PUTs** for business operations with their own rules, for example `PUT /api/v1/catalog/products/{id}/price`. They are idempotent and easy to validate and authorize separately.
+    - **JSON Merge Patch** (`PATCH`, RFC 7396) for general field edits:
+      - The patch is applied to the current resource first; the merged result then runs through the same validator as PUT.
+      - A `null` value clears a field, so fields that can't be cleared fail validation.
+      - Unknown properties are rejected (4.2).
+      - Requires `If-Match` or a body `version`, like PUT (11.3).
+      - Any other `Content-Type` on PATCH returns 415.
+    - JSON Patch (RFC 6902) is not supported.
+14. No HATEOAS. Responses carry `Location` on 201, 202 and 303; paged lists may carry `next`/`prev` links.
+
+## 3. Problem details and error handling
+
+1. Every error is an RFC 9457 problem details body with:
+   - a human-readable `title`;
+   - an occurrence-specific `detail`;
+   - a stable `code` extension;
+   - `traceId`.
+2. One global exception handler, so no exception reaches the framework unhandled.
+3. No stack traces, SQL or internal type names in responses outside Development. Full exceptions are logged server-side, and logs are never exposed over HTTP.
+4. Domain errors map to status codes through one table: not found → 404, conflict → 409, forbidden → 403, and so on.
+5. Validation and binding errors use one shape: 400 with `errors: { field: [messages] }`.
+6. A catalogue of error codes in `docs/errors.md`.
+
+## 4. Request validation and strict input
+
+1. Each request type has a validator class that runs before the endpoint.
+2. Request bodies with properties the endpoint doesn't declare are rejected with 400. This prevents mass assignment and surfaces typos, and it applies to Merge Patch bodies too.
+3. Binding errors and validation errors share one 400 shape.
+4. Sort and filter fields come from an allowlist.
+5. Limits on string length, collection size, numeric ranges and JSON nesting depth.
+6. Only JSON content types are accepted (2.8); anything else returns 415.
+
+## 5. Idempotency and request deduplication
+
+1. POST accepts an `Idempotency-Key` header, governed by a per-endpoint policy: required, optional or off, plus a TTL. Merge Patch endpoints can opt in too, because Merge Patch isn't guaranteed to be idempotent.
+2. Behaviour:
+   - Same key, same request: replay the stored status, headers and body, and add `Idempotent-Replayed: true`. "Same request" means the same method, route, body hash, user and tenant.
+   - Same key, different request: 422.
+   - Same key while the first request is still running: 409.
+   - Key missing when the policy says required: 400.
+3. Keys are scoped by tenant + user + key, so two users can't collide or read each other's stored responses.
+4. Records live on the Valkey state instance (12.9) with a TTL (default 24 h). An atomic lock is held while the request is in flight.
+5. Only 2xx and deterministic 4xx responses are stored. 5xx is never stored, so the client can retry.
+6. Deduplication is HTTP-level only, through the idempotency key.
+7. FastEndpoints' built-in idempotency may not give the 422/409 behaviour above out of the box (not verified). Evaluate it first; otherwise implement it as a pre/post-processor.
+
+## 6. Rate limiting, throttling and resource limits
+
+1. Rate limits per tenant + user, falling back to IP for anonymous calls. Exceeding a limit returns 429 + `Retry-After`.
+2. Limits are shared across instances through Valkey, so each instance doesn't get its own budget.
+3. Stricter limits on sensitive business flows such as login, signup, password reset and checkout.
+4. FastEndpoints' header-based `Throttle()` is not used for security; it trusts a client-supplied header.
+5. Request timeout (`Http:RequestTimeoutSeconds`) returns 504; request body size (`Http:MaxRequestBodyBytes`) returns 413.
+6. Page size is capped at 100 (above it returns 400). PostgreSQL has a statement timeout, and collection inputs are capped.
+7. Server limits on headers, connections, HTTP/2 streams and minimum request data rate (slow-client protection).
+8. Quotas per client or tenant when the API is exposed externally, unless a gateway handles them.
+
+## 7. Versioning, backward compatibility and deprecation
+
+1. URI versioning: `/api/v{n}/<module>/<resource>`.
+2. Additive changes (new optional fields, new endpoints) don't bump the version. Clients must ignore unknown response fields; requests stay strict (4.2).
+3. Breaking changes (removing or renaming a field, changing a type or relationship) need a new version.
+4. Deprecated versions send the `Deprecation` header (RFC 9745) and `Sunset` header (RFC 8594), plus a `Link` to migration notes.
+5. The OpenAPI contract for each version is exported and committed (10.3).
+6. An inventory of versions and endpoints per environment, with no forgotten debug or old endpoints.
+
+## 8. Asynchronous operations
+
+1. Long-running commands return 202 + `Location: /api/v1/<module>/operations/{id}`.
+2. The status resource returns `{ status, createdAt, updatedAt, error?, resultLocation? }`, where status is `pending`, `running`, `succeeded` or `failed`. It can include a cancel link.
+3. When the operation finishes, the status resource returns 303 + `Location` of the result, or 200 with the result inline.
+4. The operation row is written to PostgreSQL in the same transaction as the request. A background worker in the app picks up pending rows and runs them. It uses `FOR UPDATE SKIP LOCKED`, so several instances can share the work, and nothing is lost on restart.
+5. Transient failures are retried with backoff; a failed status records the reason.
+6. Push notification instead of polling (SSE or a webhook) is optional and off by default.
+7. Opt-in per module through a template flag, since many APIs don't need it.
+
+## 9. Pagination, filtering and sorting
+
+1. Lists are always paged: `?page=1&pageSize=20`, maximum 100. The response is `{ items, page, pageSize, totalCount, totalPages, hasNextPage, hasPreviousPage }`.
+2. A page size above the maximum returns 400.
+3. Ordering is deterministic, always with a unique tie-breaker (the ID).
+4. Keyset (cursor) paging is available as an option for large or fast-changing lists: `?cursor=...&pageSize=`. Offset paging gets slow and can skip or repeat rows when data changes, and `totalCount` is optional here because counting is expensive.
+5. Filtering uses explicit, typed query parameters (`?status=shipped&minCost=100`) checked against an allowlist. There is no free-form query language.
+6. Sorting uses `?sort=price,-createdAt` with allowlisted fields. Sort and filter parameters are part of the cache key, so they lower cache hit rates.
+7. Database indexes match the default sort and the keyset columns (14.19).
+
+## 10. OpenAPI and documentation
+
+1. Every endpoint documents its success and problem responses.
+2. Swagger UI and the live OpenAPI JSON are served only in Development.
+3. The contract is exported with a command to `docs/openapi/v{n}.json` and committed.
+4. The contract documents:
+   - auth schemes;
+   - the `Idempotency-Key` header;
+   - rate-limit headers;
+   - `ETag`/`If-Match` headers;
+   - the merge-patch media type;
+   - the error codes.
+5. Consumers can generate typed HTTP clients from the committed contract.
+
+## 11. Conditional requests and HTTP caching
+
+1. GET on an item returns a strong `ETag`; `If-None-Match` with a matching value returns 304.
+2. The ETag comes from the row's `version` column (14.16), which is cheaper than hashing the body.
+3. PUT, sub-resource PUT, PATCH and DELETE accept `If-Match` (stale returns 412) or a body `version` (stale returns 409). Sending neither returns 428.
+4. Authenticated data uses `Cache-Control: private, no-cache`; sensitive data (tokens, personal data) uses `no-store`.
+5. `Vary` is set correctly. A response that depends on the tenant always includes the tenant in the cache key.
+
+## 12. Valkey cache
+
+**Topology**
+1. Valkey as the cache server, accessed only through the Redis protocol.
+2. One shared connection for the app's lifetime.
+3. Two cache levels: L1 in memory and L2 in Valkey. A backplane clears L1 on all instances when an entry is invalidated on one.
+4. Each module gets its own named cache with its own key prefix and defaults.
+
+**Loading and invalidation**
+5. Default pattern: cache-aside, with invalidate-on-write (commit to PostgreSQL, then remove the key or tag).
+6. Invalidation by tag, for example `tenant:{t}:product:{id}`, for both the data cache and the output cache. A crash between the commit and the cache delete can leave a stale entry; short TTLs plus the backplane limit how long it lasts.
+7. Seeding at startup is opt-in and small, because seeding a large cache spikes the database.
+
+**Keys, TTL and serialization**
+8. Key format: `{service}:{module}:{tenant}:{entity}:{id}:v{schema}`.
+   - The schema version in the key stops a new deploy from reading old payloads.
+   - Keys that must share a cluster slot use hash tags `{...}`.
+9. Cache and state are kept apart, because one eviction policy can't serve both:
+   - **Cache** data (L2 and output cache) uses `allkeys-lru` eviction. Losing it is harmless.
+   - **State** (idempotency records, rate-limit counters, locks) uses `noeviction` with persistence, on a separate Valkey instance. Otherwise memory pressure could silently drop idempotency records.
+10. Every entry has a TTL: absolute by default, with per-entry overrides of a configured default.
+11. TTL jitter, so keys don't all expire at once.
+12. Serialization uses the shared `JsonDefaults`.
+
+**Stampede, resilience and consistency**
+13. Cache stampede protection:
+    - Only one caller rebuilds a missing key per instance.
+    - A distributed lock covers expensive keys across instances.
+    - Hot keys refresh early, before they expire.
+    - If a rebuild fails, the stale value is served (fail-safe).
+    - Soft and hard timeouts, so a slow database returns stale data instead of hanging.
+14. The cache is optional at runtime. If Valkey is down, requests still succeed: a circuit breaker and short timeouts fall back to L1 and PostgreSQL.
+15. A concurrency limit on the database fallback path protects PostgreSQL while the cache recovers.
+16. Multi-key atomic updates on the state instance use Lua scripts or `WATCH`/`MULTI`/`EXEC`. Note that a Redis-protocol transaction doesn't roll back when one command fails.
+17. Fire-and-forget writes only for non-critical data such as counters.
+18. The cache is never the system of record.
+
+**Consistent hashing**
+19. Valkey Cluster distributes keys over 16,384 hash slots, and the client is cluster-aware. So consistent hashing comes from Cluster mode plus hash tags. Client-side hashing is only needed for self-managed shards without Cluster mode, which the template doesn't cover.
+
+**Security**
+20. A Valkey user per service with least privilege, TLS in transit, and no public exposure.
+21. A tenant's data is never cached under a key without the tenant in it.
+
+**Output caching**
+22. Selected GET responses are cached server-side in Valkey per tenant and query string, evicted by tag, and only 200 responses are stored. User-specific responses are cached only when the user is part of the key.
+
+## 13. Write strategies
+
+1. **Write-through:** opt-in per entity, for read-heavy paths that need read-after-write freshness. Write to PostgreSQL, then write the new value to the cache, and report success only after both succeed.
+2. **Write-behind:** opt-in, and only for non-critical data that can be lost (view counters, last-seen timestamps). Values accumulate on the Valkey state instance, and a background worker flushes them to PostgreSQL through the repository. A crash can lose unflushed data, and that must be documented.
+3. **Everything else:** PostgreSQL is the single source of truth, with cache-aside and invalidate-on-write.
+
+## 14. PostgreSQL with Dapper and repositories
+
+**Connections**
+1. Dapper over the PostgreSQL driver, with no ORM. Aspire provides one pooled data source with a health check and tracing.
+2. A connection is opened per unit of work and disposed straight away, never held for a whole request.
+3. A command timeout, a `statement_timeout`, and a cancellation token on every call.
+
+**Repository pattern**
+4. One repository per aggregate, with intention-revealing methods such as `GetByIdAsync`, `ListAsync(ProductQuery)`, `AddAsync` and `UpdatePriceAsync(id, price, expectedVersion)`. There is no generic `IRepository<T>`: Dapper can't translate expressions, and a generic repository hides the SQL that matters.
+5. Repository interfaces live in the module's `Application` folder. Implementations live in `Infrastructure` and are internal to the module. Endpoints and services depend only on the interfaces.
+6. Read-side query classes may return response types directly from SQL for list and detail reads. Write-side repositories work with entities.
+7. A unit of work handles writes that touch more than one repository. A scoped object owns the connection and transaction, repositories in the same request share it, and the commit happens once, at the end of the endpoint.
+8. Repositories don't call the cache. Caching sits one level up, in a service, so cache rules stay in one place.
+
+**SQL rules**
+9. Parameterized SQL only, never values concatenated into strings. Dynamic `ORDER BY` and filter columns come from an allowlist mapping (9.5–9.6), never from raw client input.
+10. SQL lives next to its repository as constants, so queries are easy to review.
+11. Columns use snake_case, mapped automatically to C# property names.
+12. Type handlers are registered once in BuildingBlocks:
+    - `DateTimeOffset` as `timestamptz` in UTC;
+    - enums as text;
+    - `jsonb` through `JsonDefaults`;
+    - UUIDv7 IDs.
+13. Offset paging uses `LIMIT/OFFSET` plus a count. Keyset paging uses `WHERE (sort_col, id) > (@lastSort, @lastId)`. When several result sets are needed, they come back in one round trip.
+14. Source-generated, reflection-free Dapper mapping is an option if the template later targets Native AOT.
+
+**Schema, concurrency and tenancy**
+15. One PostgreSQL schema per module (`catalog.*`, `orders.*`), with no cross-module joins or foreign keys.
+16. Optimistic concurrency through an explicit `version bigint` column:
+    - `UPDATE ... SET ..., version = version + 1 WHERE id = @id AND version = @expectedVersion`.
+    - Zero rows affected means the client's copy is stale: 412 for `If-Match`, 409 for a body `version`.
+    - The same version feeds the ETag.
+17. Tenant isolation:
+    - Every repository method takes the tenant ID, and every query filters on `tenant_id`.
+    - Because one missed `WHERE` leaks data, PostgreSQL row-level security is on as a safety net, with `SET LOCAL app.tenant_id` at the start of each unit of work.
+    - Reads also run in a short transaction, so the setting applies and can't leak to the next user of a pooled connection.
+    - The app connects as a role that doesn't own the tables and isn't a superuser, because owners and superusers bypass row-level security.
+18. Audit columns (`created_at`, `created_by`, `updated_at`, `updated_by`) are set by the repository from the current user and `TimeProvider`. Soft delete is optional, with a `deleted_at IS NULL` filter in each query.
+19. Each module lists the indexes its queries need (every filter, sort and keyset column) in its README.
+
+**Schema management (no migrations)**
+20. The template ships no migrations and no migration tool. Tables, indexes, row-level security policies and roles are created and changed outside the template, by the host project's own process or a DBA. The app never creates or alters tables.
+21. Each module's README lists the tables and columns its repositories expect, so the schema can be prepared before the module is added.
+22. Schema changes stay compatible with the running app version (add first, remove later), so rolling deploys keep working.
+23. The local Aspire PostgreSQL container starts empty. The AppHost can optionally load the module's reference `db/schema.sql` when the container is first created. This is for local development only and off by default.
+
+## 15. Endpoint structure
+
+1. No mediator and no command bus. Each FastEndpoints endpoint is a use case: its handler does the work directly, or calls a plain injected service when logic is shared.
+2. FastEndpoints' own command and event bus is not used either.
+3. Cross-cutting behaviour (idempotency, auditing, log enrichment) uses endpoint pre/post-processors and middleware.
+4. Modules call each other in-process only through the interface in their `.Contracts` project, never through another module's repositories, tables or internals. When the modules run as separate services, the same contract is backed by a typed HTTP client (section 18).
+
+## 16. Authentication and authorization
+
+1. JWT bearer tokens from an external OpenID Connect provider. The token's issuer, audience, lifetime and signature are checked, signing keys come from the provider's metadata, and clock skew is small.
+2. Permission-based policies (for example `orders:write`) are declared on each endpoint. Access is denied by default; an endpoint must opt in to anonymous access explicitly.
+3. Object-level authorization on every endpoint that takes an ID:
+   - The tenant and ownership check happens in the repository query (`WHERE tenant_id = @tenantId AND owner_id = @userId`) or in the handler.
+   - A failed check returns 404 or 403.
+4. The tenant comes from a token claim, never from a client header alone.
+5. Service-to-service calls authenticate with client-credentials tokens or mTLS.
+
+## 17. Request and response logging
+
+1. Structured logging, exported with the rest of the telemetry (1.1).
+2. Every request logs method, path, status, duration, trace ID, tenant and user ID. Body logging is opt-in per endpoint, with size limits.
+3. Never logged: `Authorization`, cookies, idempotency key values, passwords, tokens or personal data. Redaction is built in rather than left to each call site.
+4. Log levels can be changed at runtime.
+5. A separate audit log (who did what, when) where regulation requires it.
+
+## 18. Outbound calls
+
+1. Typed HTTP clients declared as interfaces, using the shared `JsonDefaults`.
+2. Every HTTP client gets the standard resilience pipeline from ServiceDefaults:
+   - total and per-attempt timeouts;
+   - retries with jitter;
+   - a circuit breaker.
+3. Only idempotent methods (GET, PUT, DELETE) are retried. A POST is retried only when it carries an `Idempotency-Key`.
+4. Base addresses come from Aspire service discovery (for example `https+http://catalog`), so the same client works in the monolith and between services.
+5. `traceparent`, `X-Correlation-Id` and, for service-to-service calls, the access token are propagated on every outbound call.
+6. Upstream failures map to problem details: a timeout returns 504; an unavailable upstream or an open circuit returns 503.
+7. Third-party responses are validated and size-limited; upstream data is not trusted.
+8. Outbound hosts come from an allowlist, and user-supplied URLs are never fetched without validation (SSRF).
+9. Graceful shutdown drains in-flight requests, stops background workers and flushes telemetry.
+
+## 19. Transport, headers and hardening
+
+1. Outside Development:
+   - HTTPS redirection (308) and HSTS, except on `/health/*` and `/metrics`.
+   - Secure-only cookies.
+2. `X-Forwarded-*` headers are honoured only from configured known proxies and networks.
+3. Security headers on every response:
+   - `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`, `Cross-Origin-Opener-Policy`;
+   - a locked-down CSP (relaxed only for the Swagger UI);
+   - no `Server` header.
+4. Brotli/gzip response compression, but not on responses that mix secrets with attacker-controlled input (BREACH).
+5. CORS uses a named policy with explicit origins from configuration, and never `*` with credentials.
+6. Configuration is validated at startup, so a bad setting fails fast.
+7. Secrets come from environment variables, user-secrets locally, or a secret store, and never from `appsettings`.
+8. The container image is a minimal (chiseled) .NET image, running as a non-root user on a read-only filesystem.
+
+## 20. Solution layout
+
+1. **AppHost (Aspire):** declares PostgreSQL and its database, the two Valkey instances (cache and state, 12.9), the Host, and optionally an identity provider. It wires their connections and startup order.
+2. **ServiceDefaults:** telemetry, health checks, service discovery and the resilience pipeline. Every host references it.
+3. **Host:** the composition root, and the only project with a `Program.cs`. It references the modules and BuildingBlocks, calls each module's registration, and configures FastEndpoints, authentication, problem details, rate limiting, headers and the rest.
+4. **Modules/\<Module\>:** class libraries without a `Program.cs`. Each one:
+   - exposes an `IModule` with `AddServices(IServiceCollection, IConfiguration)` and its endpoint assembly;
+   - owns its database schema, repositories, cache prefix and OpenAPI tag.
+5. **Modules/\<Module\>.Contracts:** the public interface other modules may call (15.4).
+6. **BuildingBlocks:** shared code, consumed as a NuGet package or a project reference. It contains:
+   - `JsonDefaults` and problem details mapping;
+   - idempotency, rate-limit policies and cache conventions;
+   - persistence helpers, the Merge Patch helper and security headers.
+7. **Monolith or microservice:** in a monolith, one Host references many modules. As a microservice, a Host references one module and reaches the others over HTTP with service discovery. The module code is the same either way.
+8. **`dotnet new` parameters:**
+   - module name and route prefix;
+   - `--host` to generate a new Host and AppHost, or `--module-only` to add a module to an existing Host;
+   - `--async-ops` and `--write-behind`.
+9. Local development runs entirely through the AppHost (`dotnet run --project <Name>.AppHost`), with no `docker-compose`. A container runtime is still required.
+
+## 21. Solution, build and code conventions
+
+1. `Directory.Build.props` at the solution root holds the shared settings:
+   - nullable reference types, warnings, analyzers and analysis level;
+   - implicit usings and deterministic builds;
+   - XML documentation output, which feeds the OpenAPI descriptions (with the missing-comment warning suppressed).
+2. Central package management with `Directory.Packages.props`:
+   - Project files reference packages without versions.
+   - Transitive pinning is on, so transitive versions can be set in one place too.
+3. Every `.csproj` pins `<TargetFramework>net10.0</TargetFramework>` and `<LangVersion>14</LangVersion>` explicitly, so a project file read on its own says what it targets.
+4. `global.json` pins the SDK version, so every machine builds with the same SDK.
+5. Nullable reference types across the solution: `<Nullable>enable</Nullable>`.
+6. Warnings are errors in CI: `<TreatWarningsAsErrors Condition="'$(ContinuousIntegrationBuild)' == 'true'">true</TreatWarningsAsErrors>`. Locally they stay warnings, except nullable warnings, which are errors everywhere.
+7. `<AnalysisLevel>latest-recommended</AnalysisLevel>` for all projects. AppHost and ServiceDefaults may drop to `latest-default` if it gets noisy there.
+8. `.editorconfig` from day one, with `<EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>` so style rules fail the build, not just the editor.
+9. File-scoped namespaces, enforced with `csharp_style_namespace_declarations = file_scoped:error`.
+10. Extra analyzers are added once in `Directory.Build.props`, marked as private assets so they don't flow to consumers.
+11. NuGet audit runs on every restore, so packages with known vulnerabilities show up as warnings (errors in CI).
+12. Package lock files, for reproducible restores.
+13. `.gitattributes` and `.gitignore` for .NET, with UTF-8 and LF line endings set in `.editorconfig`.
+
+---
+
+## Packages
+
+All packages are free and open source (MIT, Apache-2.0, BSD or the PostgreSQL licence). Commercial packages and packages with paid tiers for core features are not allowed.
+
+**Used by the template**
+
+| Area | Package | Licence |
+|---|---|---|
+| Orchestration | .NET Aspire (AppHost, ServiceDefaults, PostgreSQL and Valkey integrations) | MIT |
+| Endpoints | FastEndpoints | MIT |
+| Validation | FluentValidation (built into FastEndpoints) | Apache-2.0 |
+| OpenAPI | FastEndpoints.Swagger (NSwag) | MIT |
+| OpenAPI UI (optional) | Scalar | MIT |
+| Database driver | Npgsql | PostgreSQL |
+| Data access | Dapper | Apache-2.0 |
+| Cache server | Valkey | BSD-3 |
+| Cache client | StackExchange.Redis | MIT |
+| Cache library | FusionCache (+ Redis backplane, System.Text.Json serializer) | MIT |
+| Output cache store | Microsoft.AspNetCore.OutputCaching.StackExchangeRedis | MIT |
+| Distributed rate limiting | RedisRateLimiting (or a small Lua script) | MIT |
+| HTTP clients | Refit + Refit.HttpClientFactory | MIT |
+| Resilience | Microsoft.Extensions.Http.Resilience (Polly v8) | MIT / BSD-3 |
+| Telemetry | OpenTelemetry .NET | Apache-2.0 |
+| Log redaction | Microsoft.Extensions.Compliance.Redaction | MIT |
+| Mapping | Hand-written mapping, no external package needed | — |
+| Analyzers | Meziantou.Analyzer, Roslynator | MIT, Apache-2.0 |
+| Identity provider (external) | Keycloak or OpenIddict | Apache-2.0 |
+| Container runtime (local) | Podman (or Docker Engine) | Apache-2.0 |
+
+**Candidates for later** (see the list below): xUnit v3, Shouldly, NSubstitute, Testcontainers, FastEndpoints.Testing, k6, Trivy, CycloneDX, Quartz.NET, Microsoft.FeatureManagement and YARP.
+
+---
+
+## Still missing from the template
+
+What a production template still needs beyond this plan.
+
+**Priority:**
+- **Must:** needed before teams use the template for real.
+- **Should:** add soon after.
+- **Could:** add when a module asks for it.
+
+### Must
+
+1. **CI/CD pipeline.** Build with warnings as errors (21.6), NuGet audit, an OpenAPI contract check against the committed file, container image build, and deployment.
+2. **Tests.**
+   - Unit tests for logic.
+   - Integration tests against real PostgreSQL and Valkey containers.
+   - Architecture tests that enforce module boundaries.
+   - Contract tests against the committed OpenAPI file.
+3. **Container image and deployment manifests.** An image build, plus Kubernetes or Helm manifests whose probes use the health checks in 1.8.
+4. **Tenant model.** How tenants are created and configured, and how quotas and feature access are set per tenant. The plan assumes a tenant claim and row-level security, but not where tenants come from.
+5. **Shared data-protection keys.** ASP.NET Core's data-protection keys must be stored centrally (Valkey or PostgreSQL). Otherwise cookies, antiforgery tokens and protected values break after a restart or on another instance.
+6. **Configuration per environment.** Which settings live in `appsettings`, environment variables or the secret store, and how each is validated (19.6).
+7. **Documentation.** A README, architecture decision records, and runbooks covering how to add a module, how to run locally, and what to do when PostgreSQL or Valkey is down.
+8. **A sample module.** One small, complete module (for example catalog with products and prices) that exercises every convention, so users start from working code.
+
+### Should
+
+9. **Server-Sent Events.** Streaming endpoints need:
+   - authentication;
+   - a heartbeat and `Last-Event-ID` resume;
+   - a cap on open connections per user;
+   - proxy buffering turned off.
+
+   Sending events to clients connected to other instances needs a fan-out channel. Valkey pub/sub fits, but it is a light form of messaging, so it needs a decision.
+10. **Webhooks.**
+    - Outgoing: a subscription registry, HMAC-signed payloads with a timestamp (Standard Webhooks format), retries with backoff, a delivery log and a replay endpoint. Deliveries run on the async-operations worker (8.4).
+    - Incoming: signature and timestamp checks, and deduplication by event ID.
+11. **File upload and download.** Streaming multipart uploads with size limits, content-type checks and malware scanning. Range requests (206) for downloads. The bytes go in S3-compatible object storage, not PostgreSQL.
+12. **Personal data and erasure.** What is deleted and what is anonymised, how cached copies and logs are handled, and retention periods.
+13. **Scheduled and recurring jobs.** For example cleanup of expired records, write-behind flushes and reports. A periodic background worker covers simple cases; a scheduler library covers anything more.
+14. **API keys for machine clients.** Hashed keys with scopes, expiry and rotation, for partners who can't use OAuth.
+15. **Service-to-service identity.** Set up mTLS or client-credentials tokens between services in the microservice setup.
+16. **Feature flags.** The status-code list has 503 for a disabled feature, but nothing in the plan provides flags yet.
+17. **Dashboards, alerts and SLOs.** Error rate, latency and saturation per module, with alert rules, fed by the OTLP telemetry.
+18. **Security scanning.** Container image scanning, an SBOM, static analysis, and automated dependency updates.
+19. **Template tests and publishing.** Generate a project with each flag combination and check that it builds and starts. Version the template and BuildingBlocks with semantic versioning and a changelog, and publish them to a NuGet feed.
+
+### Could
+
+20. **Real-time two-way communication** (WebSockets or SignalR), if a module needs more than SSE.
+21. **gRPC** for internal service-to-service traffic, as an alternative to HTTP clients.
+22. **Bulk import and export** of CSV or JSON, run as async operations (section 8).
+23. **Column-level encryption** for sensitive fields such as national IDs, with key rotation.
+24. **Full-text search** using PostgreSQL's built-in search before anything heavier.
+25. **Distributed locks or leader election**, so a recurring job runs on one instance only. PostgreSQL advisory locks are enough.
+26. **API gateway or reverse proxy** for routing, TLS termination and coarse rate limiting in front of the services.
+27. **Localization** of problem details and validation messages, based on `Accept-Language`.
+28. **Cookie authentication and antiforgery**, only if a browser front end calls the API with cookies.
+29. **Performance baseline:** a load-test script per module with target latencies.
